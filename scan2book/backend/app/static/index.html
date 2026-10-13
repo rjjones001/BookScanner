@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scan2Book - scanned PDF to typeset PDF</title>
+<style>
+  :root { --fg:#16181d; --muted:#5b6270; --line:#dde1e8; --accent:#1f4fd8; --bg:#f6f7f9; --warn:#a15c00; --bad:#b3261e; --ok:#1b7a3d; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.5 system-ui,sans-serif; color:var(--fg); background:var(--bg); }
+  header { padding:20px 16px 8px; max-width:960px; margin:auto; }
+  h1 { margin:0; font-size:1.5rem; } h2 { font-size:1.1rem; margin:0 0 12px; }
+  main { max-width:960px; margin:auto; padding:8px 16px 48px; display:grid; gap:16px; }
+  section { background:#fff; border:1px solid var(--line); border-radius:12px; padding:16px; }
+  .muted { color:var(--muted); font-size:.9rem; }
+  form { display:grid; gap:12px; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); }
+  label { display:grid; gap:4px; font-size:.9rem; } .full { grid-column:1/-1; }
+  input,select,textarea,button { font:inherit; padding:9px 10px; border:1px solid var(--line); border-radius:8px; background:#fff; }
+  button { cursor:pointer; background:var(--accent); color:#fff; border:0; } button.sec { background:#eef1f6; color:var(--fg); }
+  button.danger { background:#fdecea; color:var(--bad); } button:disabled { opacity:.5; cursor:default; }
+  .drop { border:2px dashed var(--line); border-radius:12px; padding:20px; text-align:center; }
+  .drop.over { border-color:var(--accent); background:#f1f5ff; }
+  .job { border-top:1px solid var(--line); padding:12px 0; } .job:first-of-type { border-top:0; }
+  progress { width:100%; height:10px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .tag { font-size:.75rem; padding:2px 8px; border-radius:99px; background:#eef1f6; }
+  .tag.done{background:#e6f4ea;color:var(--ok)} .tag.failed{background:#fdecea;color:var(--bad)} .tag.running,.tag.queued{background:#e8f0fe;color:var(--accent)}
+  .warn { color:var(--warn); font-size:.85rem; margin:2px 0; } details summary { cursor:pointer; }
+  .card { display:grid; gap:8px; grid-template-columns:1fr; border:1px solid var(--line); border-radius:10px; padding:10px; margin:10px 0; }
+  @media (min-width:700px){ .card { grid-template-columns:1fr 1fr; } }
+  .card img { max-width:100%; border:1px solid var(--line); border-radius:6px; background:#fafafa; }
+  textarea { width:100%; min-height:90px; font-family:ui-monospace,monospace; font-size:.9rem; }
+  .note { background:#fff8e6; border:1px solid #f1d58a; border-radius:8px; padding:8px 10px; font-size:.88rem; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Scan2Book</h1>
+  <div class="muted">Upload a scanned PDF, get a newly typeset, searchable PDF. Always review flagged regions before relying on the result.</div>
+</header>
+<main>
+  <section>
+    <h2>1. Upload and configure</h2>
+    <div id="privacy" class="note" style="margin-bottom:12px"></div>
+    <form id="form">
+      <div class="drop full" id="drop">
+        <div>Drag a PDF here or <label style="display:inline"><u>choose a file</u><input id="file" name="file" type="file" accept="application/pdf" hidden></label></div>
+        <div class="muted" id="fileinfo">No file selected</div>
+      </div>
+      <label>Mode
+        <select name="mode"><option value="textbook">Textbook</option><option value="pyq">PYQ / Question bank</option></select></label>
+      <label>Page size
+        <select name="page_size"><option value="a4">A4</option><option value="letter">Letter</option><option value="a5">A5</option></select></label>
+      <label>Font <select name="font" id="font"></select></label>
+      <label>Text size
+        <select name="font_size"><option>10</option><option selected>11</option><option>12</option></select></label>
+      <label>Processing quality
+        <select name="quality">
+          <option value="standard">Standard (200 dpi, fastest)</option>
+          <option value="advanced">Advanced (300 dpi, deskew, AI suggestions if configured)</option>
+          <option value="high">High accuracy (400 dpi, slowest)</option></select></label>
+      <label>Gap between questions (pt) <input name="question_gap" type="number" min="0" max="40" value="8"></label>
+      <label><span><input type="checkbox" name="handwriting" value="true"> Handwriting present</span>
+        <span class="muted">Tesseract is weak at handwriting; uncertain regions are flagged for review.</span></label>
+      <label><span><input type="checkbox" name="force_ocr" value="true"> Force OCR even if the PDF has a text layer</span></label>
+      <label>Figures <select disabled><option>Keep original images (redrawing not implemented)</option></select></label>
+      <div class="full row"><button id="go" disabled>Convert</button><span id="err" class="warn"></span></div>
+    </form>
+  </section>
+  <section><h2>2. Jobs</h2><div id="jobs" class="muted">Loading...</div></section>
+  <section id="detail" hidden><h2>3. Review and export</h2><div id="detailbody"></div></section>
+</main>
+<script>
+const $ = s => document.querySelector(s);
+let cfg = {}, selected = null, file = null;
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+async function api(path, opts) { const r = await fetch('/api' + path, opts); if (!r.ok) { let m = r.statusText; try { m = (await r.json()).detail || m } catch {} throw new Error(m) } return r.json(); }
+
+async function init() {
+  cfg = await api('/config');
+  $('#privacy').textContent = `OCR: ${cfg.ocr_engine}. ${cfg.third_party_disclosure} Files are kept for ${cfg.retention_days} days unless you delete them. Limits: ${cfg.max_upload_mb} MB, ${cfg.max_pages} pages.`;
+  $('#font').innerHTML = cfg.fonts.map(f => `<option>${f}</option>`).join('');
+  refresh(); setInterval(refresh, 2000);
+}
+function setFile(f) {
+  file = f; $('#go').disabled = !f;
+  $('#fileinfo').textContent = f ? `${f.name} - ${(f.size/1048576).toFixed(1)} MB` : 'No file selected';
+}
+$('#file').onchange = e => setFile(e.target.files[0]);
+const drop = $('#drop');
+['dragover','dragenter'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
+['dragleave','drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
+drop.addEventListener('drop', e => setFile(e.dataTransfer.files[0]));
+
+$('#form').onsubmit = async e => {
+  e.preventDefault(); $('#err').textContent = '';
+  const fd = new FormData(e.target); fd.set('file', file);
+  fd.set('handwriting', e.target.handwriting.checked); fd.set('force_ocr', e.target.force_ocr.checked);
+  try { const r = await api('/jobs', { method: 'POST', body: fd }); selected = r.id; refresh(); }
+  catch (er) { $('#err').textContent = er.message; }
+};
+
+async function refresh() {
+  const jobs = await api('/jobs');
+  $('#jobs').innerHTML = jobs.length ? jobs.map(j => {
+    const active = j.status === 'running' || j.status === 'queued';
+    const pct = j.pages_total ? Math.round(100 * (j.pages_done + j.pages_failed) / j.pages_total) : 0;
+    return `<div class="job"><div class="row"><b>${esc(j.filename)}</b><span class="tag ${j.status}">${j.status}</span>
+      <span class="muted">${esc(j.stage)} - ${j.pages_done + j.pages_failed}/${j.pages_total} pages${j.pages_failed ? `, ${j.pages_failed} failed` : ''}</span></div>
+      ${active ? `<progress value="${pct}" max="100"></progress>` : ''}
+      ${j.error ? `<div class="warn">${esc(j.error)}</div>` : ''}
+      <div class="row" style="margin-top:6px">
+        <button class="sec" onclick="openJob('${j.id}')">Open</button>
+        ${active ? `<button class="sec" onclick="act('${j.id}','cancel')">Cancel</button>` : `<button class="sec" onclick="act('${j.id}','retry')">Retry</button>`}
+        ${j.status === 'done' ? `<a href="/api/jobs/${j.id}/pdf"><button type="button">Download PDF</button></a>` : ''}
+        <button class="danger" onclick="del('${j.id}')">Delete</button></div></div>`;
+  }).join('') : 'No jobs yet.';
+  if (selected && !document.activeElement.matches('textarea')) renderDetail(jobs.find(j => j.id === selected), false);
+}
+async function act(id, a) { try { await api(`/jobs/${id}/${a}`, { method: 'POST' }); } catch (e) { alert(e.message); } refresh(); }
+async function del(id) { if (!confirm('Delete this job and its files?')) return; try { await api(`/jobs/${id}`, { method: 'DELETE' }); if (selected === id) { selected = null; $('#detail').hidden = true; } } catch (e) { alert(e.message); } refresh(); }
+function openJob(id) { selected = id; refresh(); $('#detail').scrollIntoView(); }
+
+let lastKey = '';
+async function renderDetail(j, force) {
+  if (!j) return; $('#detail').hidden = false;
+  const key = j.id + j.status + j.updated; if (key === lastKey && !force) return; lastKey = key;
+  let html = `<div class="row"><b>${esc(j.filename)}</b><span class="tag ${j.status}">${j.status}</span></div>`;
+  if (j.status === 'done') html += `<div class="row" style="margin:8px 0">
+     <a href="/api/jobs/${j.id}/pdf"><button type="button">Download typeset PDF</button></a>
+     <a href="/api/jobs/${j.id}/markdown"><button type="button" class="sec">Markdown</button></a>
+     <a href="/api/jobs/${j.id}/source"><button type="button" class="sec">Original PDF</button></a>
+     <button class="sec" onclick="rebuild('${j.id}')">Regenerate PDF after edits</button></div>`;
+  if (j.warnings.length) html += `<details ${j.warnings.length < 6 ? 'open' : ''}><summary>${j.warnings.length} warning(s)</summary>${j.warnings.map(w => `<div class="warn">${esc(w)}</div>`).join('')}</details>`;
+  if (j.status === 'done' || j.status === 'failed') {
+    let q = []; try { q = await api(`/jobs/${j.id}/review`); } catch {}
+    html += `<h3>Review queue (${q.length})</h3><div class="muted">Uncertain text, shown next to the original crop. Nothing is changed until you save.</div>`;
+    html += q.map(it => `<div class="card"><div><div class="muted">Page ${it.page} - ${it.kind} - confidence ${(it.conf*100).toFixed(0)}%</div>
+        <img loading="lazy" src="/api/jobs/${j.id}/blocks/${it.block}/crop" alt="original region"></div>
+        <div><textarea id="t_${it.block}">${esc(it.text)}</textarea>
+        ${it.suggestion ? `<div class="note">AI suggestion (unverified): <code>${esc(it.suggestion)}</code> <button type="button" class="sec" onclick="document.getElementById('t_${it.block}').value=this.previousElementSibling.textContent">Use</button></div>` : ''}
+        <div class="row" style="margin-top:6px"><button onclick="save('${j.id}','${it.block}')">Confirm / save</button></div></div></div>`).join('');
+  }
+  $('#detailbody').innerHTML = html;
+}
+async function save(id, block) {
+  const text = document.getElementById('t_' + block).value;
+  try { await api(`/jobs/${id}/blocks/${block}`, { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ text }) }); lastKey = ''; refresh(); }
+  catch (e) { alert(e.message); }
+}
+async function rebuild(id) { try { await api(`/jobs/${id}/rebuild`, { method: 'POST' }); } catch (e) { alert(e.message); } lastKey = ''; refresh(); }
+init();
+</script>
+</body>
+</html>
